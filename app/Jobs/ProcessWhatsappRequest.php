@@ -29,87 +29,82 @@ class ProcessWhatsappRequest implements ShouldQueue
      */
     public function handle(): void
     {
-        Log::info('handle of queue started');
-        $action = $this->incomingInputPayload['action'];
-        Log::info("action is: $action");
-        switch($action){
-            case 'INCOMING_MESSAGE':
-                Log::info("case selected: INCOMING_MESSAGE");
-                $this->handleIncomingMessage($this->incomingInputPayload['data']);
-                break;
-            case 'INCOMING_STATUS':
-                Log::info("case selected: INCOMING_STATUS");
-                $this->handleIncomingStatus($this->incomingInputPayload['data']);
-                break;
-            default:
-                Log::info("case selected: default");
-                $this->handleDefault($this->incomingInputPayload['data']);
-        };
+        Log::withContext([
+            'job_id' => $this->job->getJobId(),
+            'action' => $this->incomingInputPayload['action'] ?? 'unknown'
+        ]);
+        Log::info('whatsapp message processing has started in queue');
+        try{
+            $action = $this->incomingInputPayload['action'];
+            $data = $this->incomingInputPayload['data'];
+            if(!$action || !$data){
+                Log::warning('Webhook handling initiated without any action or data payload');
+                return;
+            }
+            match($action){
+                'INCOMING_MESSAGE'=>$this->handleIncomingMessage($data),
+                'INCOMING_STATUS'=>$this->handleIncomingStatus($data),
+                default=>$this->handleDefault($data)
+            };
+        }catch(\Throwable $e){
+            Log::error('webhook handling error: '.$e->getMessage(),['trace'=>$e->getTraceAsString()]);
+            throw $e;
+        }
     }
     private function handleIncomingMessage(array $payloadData):bool{
-        try{
-            Log::info("incoming message handling started");
+        Log::info("incoming message handling started");
+        return DB::transaction(function() use($payloadData){
+            $now = now();
             $isAIPhaseSuccessfullyDone = false;
             $r1 = $this->saveConvoAndMessage($payloadData);
-            Log::info('saved convo and message',$r1);
             if($r1['error']){
-               return false;//TODO: handle later
+                throw new \Exception('unable to store convo/message');
             }
             //get the wa_id of the conversation
-            $waId = $payloadData['entry'][0]['changes'][0]['value']['contacts'][0]['wa_id'];
+            $waId = data_get($payloadData,'entry.0.changes.0.value.contacts.0.wa_id');
+            //take current message for prompt TODO: handle the audio message(important)
+            $currentMessage = data_get($payloadData,'entry.0.changes.0.value.messages.0.text.body');
             //get the concerned conversation
             $concernedConvo = Conversation::with('messages')
             ->where('wa_id',$waId)
-            ->first();
+            ->firstOrFail();
+            //take current metadata of conversation for prompt
+            $currentMetadata = $concernedConvo->metadata;
+            //get the current message timestamp
+            $messageTimestampObject = Carbon::createFromTimestamp($r1['message_timestamp']);
             //if the last sent message(means the ongoing message here) sent more than 23 hours ago
-            if(Carbon::createFromTimestamp($r1['message_timestamp'])->diffInHours(now()) > 23){
-                Log::info("this ongoing message was sent more than 23 hours ago");
-                $now = date('Y-m-d h:i:s');
+            if($messageTimestampObject->diffInHours(now()) > 23){
                 $reply = 'How may I help you today?';
-                $sendMessageResponse = $this->sendWhatsappMessage('template',$reply,$concernedConvo->phone_number);
-                Log::info("reply sent by system",$sendMessageResponse);
+                $messageType = 'template';
             }elseif($r1['action'] === 'RESPOND_THROUGH_AI'){
-                Log::info("flow will be handled by AI");
-                $now = date('Y-m-d h:i:s');
                 //generate history string for prompt
                 $historyString = $this->generateMessageHistoryString($concernedConvo);
-                Log::info("history string generated: $historyString");
-                //take current message for prompt TODO: handle the audio message(important)
-                $currentMessage = $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'];
                 //generate semantic recall string for prompt
                 $semanticRecallString = $this->generateSemanticRecallString($concernedConvo->id,$currentMessage);
-                Log::info("semantic recall string generated: $semanticRecallString");
-                //take current metadata of conversation for prompt
-                $currentMetadata = $concernedConvo->metadata;
                 //create prompt for ai call
                 $prompt = $this->generatePrompt($currentMetadata,$historyString,$semanticRecallString,$currentMessage);
-                Log::info("prompt generated: $prompt");
                 //do the ai call
                 $aiResponse = $this->doAICall($prompt);
-                Log::info("AI call done: ",$aiResponse);
-                $aiCallErrorCheck = $this->checkAICallErrors($aiResponse);
-                Log::info("AI call error check response,",$aiResponse);
-                if($aiCallErrorCheck['error']){
-                    return false; //TODO: handle later
+                if($this->checkAICallErrors($aiResponse)['error']){
+                    throw new \Exception('AI provider unreachable or returned error');
                 }
-                $aiResponseArray = json_decode($aiResponse['data']['choices'][0]['message']['content'],true);
+                $aiContent = json_decode(data_get($aiResponse,'data.choices.0.message.content'),true);
                 //gather important informations from the ai response
-                $reply = $aiResponseArray['reply'];
-                $metadata = $aiResponseArray['metadata'];
-                $is_completed = $aiResponseArray['is_completed'];
+                $reply = $aiContent['reply'] ?? 'I am sorry, I am having trouble processing that.';
+                $metadata = $aiContent['metadata'] ?? json_decode($currentMetadata,true);
+                $is_completed = $aiContent['is_completed'] ?? false;
                 $metadataCount = count($metadata);
-                $sendMessageResponse = $this->sendWhatsappMessage('text',$reply,$concernedConvo->phone_number);
                 $isAIPhaseSuccessfullyDone = true;
-                Log::info("reply sent by system",$sendMessageResponse);
+                $messageType = 'text';
             }elseif($r1['action'] === 'RESPOND'){
-                Log::info("reply will be handled by only RESPOND by the system itself");
-                $now = date('Y-m-d h:i:s');
                 $reply = 'Our team is reviewing your request based on your given details. You will be contacted ASAP. Thank you.';
-                $sendMessageResponse = $this->sendWhatsappMessage('text',$reply,$concernedConvo->phone_number);
-                Log::info("reply sent by system",$sendMessageResponse);
+                $messageType = 'text';
             }else{
-                Log::info("no case matched. aborting",);
-                return false;//TODO: handle later
+                throw new \Exception('no valid action');
+            }
+            $sendMessageResponse = $this->sendWhatsappMessage($messageType,$reply,$concernedConvo->phone_number);
+            if($sendMessageResponse['error']){
+                throw new \Exception('sending message failed');
             }
             $messageDataset = [
                 'whatsapp_message_id'=>$sendMessageResponse['data']['messages'][0]['id'],
@@ -119,29 +114,21 @@ class ProcessWhatsappRequest implements ShouldQueue
                 'message_timestamp'=>$now,
                 'failed_reason'=>null,
                 'body' => $reply,
-                'created_at'=>$now,
-                'updated_at'=>$now
             ];
-            Log::info("reply message dataset created",$messageDataset);
             $concernedConvo->messages()->create($messageDataset);
-            Log::info("reply message entry created");
             $convoUpdateDataset = [
                 'last_message_at' => $now
             ];
             if($isAIPhaseSuccessfullyDone){
                 $convoUpdateDataset['metadata'] = json_encode($metadata);
-                $convoUpdateDataset['status'] = $is_completed && $metadataCount === (int) env('MAX_INFO_META_KEY_COUNT')?'qualified':'active'; /**TODO:later, make it dynamic using env variable */
-                Log::info("message was handled by ai, so metadata and status update entry created for convo update");
+                $convoUpdateDataset['status'] = $is_completed && $metadataCount >= (int) config('customparam.MAX_INFO_META_KEY_COUNT')?'qualified':'active';
             }
             $concernedConvo->update($convoUpdateDataset);
-            Log::info("convo updated and flow completed");
             return true;
-        }catch(\Exception $e){
-           Log::info("unexpected error: ".$e->getMessage().$e->getLine());
-           return false; //TODO: handle later
-        }
+        });
     }
     private function generatePrompt(string|null $currentMeta,string $historyString,string $semantiRecallString, string $currentMessage){
+        $meta = $currentMeta ?? '{}';
         $prompt = <<<EOD
                 ### 1. ROLE
                     You are the Legal Intake Assistant for a criminal defense law firm. Your voice is professional, empathetic, and direct.
@@ -181,12 +168,12 @@ class ProcessWhatsappRequest implements ShouldQueue
                 - All the information of the metadata is necessary. keep asking if not provided.
                 - Once you realize that you currently have all the values needed for the metadata, you will reply saying thank you and the
                   administration will contact you sortly.
-                - If you already have all the metadata present, reply with a message saying thank you and the administration will contact you sortly.
+                - If you already have all the metadata present, reply with a message saying thank you and the administration will contact you shortly.
                 ### 7. CURRENT CONTEXT
-                - **CURRENT_METADATA**: $currentMeta
+                - **CURRENT_METADATA**: $meta
                 - **SEMANTIC_RECALL**: $semantiRecallString
                 - **RECENT_HISTORY**: $historyString
-                - **USER_CURRENT_MESSAGE: $currentMessage
+                - **USER_CURRENT_MESSAGE**: $currentMessage
 
                 ### 8. MANDATORY OUTPUT FORMAT
                 Return ONLY a valid JSON object. No pre-amble, no conversational text outside the JSON.
@@ -202,9 +189,17 @@ class ProcessWhatsappRequest implements ShouldQueue
         $vectorService = new VectorService();
         $currentMessageVector = $vectorService->getVector($currentMessage);
         $vectorLiteral = '['.implode(',',$currentMessageVector).']';
+        //get the ID of those messages which are already present in the history string
+        $excludeIds = Message::where('conversation_id',$convoId)
+        ->whereNotNull('body')
+        ->latest()
+        ->limit(10)
+        ->pluck('id');
         //last 3 entry fetch close to the current message context
         $semanticRecallData = Message::select('direction','body')
         ->where('conversation_id',$convoId)
+        ->whereNotNull('body')
+        ->whereNotIn('id',$excludeIds)
         ->orderByRaw("embedding <-> ?",[$vectorLiteral])
         ->limit(3)
         ->get();
@@ -212,24 +207,26 @@ class ProcessWhatsappRequest implements ShouldQueue
         $semanticRecallString = "";
         foreach($semanticRecallData as $eachMessage){
         $role = $eachMessage->direction === 'inbound'?'user':'assistant';
-        $message = $eachMessage->body;
+        $message = trim(str_replace(["\r","\n"]," ",$eachMessage->body));
         $semanticRecallString.="- $role: $message\n";
         }
-        return $semanticRecallString;
+        return filled($semanticRecallString)?$semanticRecallString:"No relevant past context found.";
     }
     private function generateMessageHistoryString(Conversation $conversation):string{
         //get history of 10 messages of the conversation and take it in a certain format
         $history = $conversation->messages()
+        ->whereNotNull('body')
         ->latest()
         ->limit(10)
-        ->get();
+        ->get()
+        ->reverse();
         $historyString = '';
         foreach($history as $eachMessageEntry){
             $role = $eachMessageEntry->direction === 'inbound'?'user':'assistant';
-            $message = $eachMessageEntry->body;
+            $message = trim(str_replace(["\r","\n"]," ",$eachMessageEntry->body));
             $historyString .= "- $role: $message\n";
         }
-        return $historyString;
+        return filled($historyString)?$historyString:'No previous history.';
     }
     private function doAICall(string $prompt):array{
         $groqCall = new GroqCall();
@@ -237,38 +234,50 @@ class ProcessWhatsappRequest implements ShouldQueue
         return $aiResponse;
     }
     private function checkAICallErrors(array $aiCallResponse){
-        Log::info('Ai response messge is : '. $aiCallResponse['message']);
         //check if error comes from AI call
         if($aiCallResponse['error']){
             return [
                 'error'=>true,
-                'message'=>'AI call error'
+                'message'=>'AI provider unreachable or API error'
             ];
         }
+        $content = data_get($aiCallResponse,'data.choices.0.message.content');
         //check if ai response actually came and it is a valid json
-        if(!$aiCallResponse['data']['choices'][0]['message']['content'] || !$this->isValidJson($aiCallResponse['data']['choices'][0]['message']['content'])){
+        if(!$content || !$this->isValidJson($content)){
             return [
                 'error' => true,
-                'message' => 'no response from AI'
+                'message' => 'AI response was malformed or empty'
             ];
         }
         return [
             'error' => false,
+            'message' => 'AI call validation successful'
         ];
     }
     //save convo and message and then decide what to do next
     private function saveConvoAndMessage(array $payloadData):array{
         Log::info('convo and message saving function started');
-        DB::beginTransaction();
+        //collect data to insert in conversations and messages table
+        $name  = data_get($payloadData,'entry.0.changes.0.value.contacts.0.profile.name');
+        $phoneNumber = data_get($payloadData,'entry.0.changes.0.value.messages.0.from');
+        $messageId = data_get($payloadData,'entry.0.changes.0.value.messages.0.id');
+        $type = data_get($payloadData,'entry.0.changes.0.value.messages.0.type');
+        $messageTimestamp = data_get($payloadData,'entry.0.changes.0.value.messages.0.timestamp');
+        //existing message check for duplicacy
+        $doesMessageAlreadyExists = Message::where('whatsapp_message_id',$messageId)->exists();
+        if($doesMessageAlreadyExists){
+            return [
+                'error' => true,
+                'message' => 'duplicate message entry',
+                'action'=>null,
+                'metadata'=>null
+            ];
+        }
         try{
-            //collect data to insert in conversations and messages table
-            $now = date('Y-m-d h:i:s');
-            $waId = $payloadData['entry'][0]['changes'][0]['value']['contacts'][0]['wa_id'];
-            $name  = $payloadData['entry'][0]['changes'][0]['value']['contacts'][0]['profile']['name'];
-            $phoneNumber = $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['from'];
-            $messageId = $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['id'];
-            $type = $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['type'];
-            $messageTimestamp = $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['timestamp'];
+            $now = now();
+            $waId = data_get($payloadData,'entry.0.changes.0.value.contacts.0.wa_id');
+            $messageBody = null;
+            $embeddingArray = null;
             //find or create the conversation table entry
             $convoData = Conversation::firstOrCreate(
                 [
@@ -282,6 +291,8 @@ class ProcessWhatsappRequest implements ShouldQueue
                     'updated_at'=>$now
                 ]
             );
+            //check if the message is the first message of the conversation
+            $isInitial =!$convoData->messages()->exists();
             //create message dataset
             $messageDataset = [
                 'whatsapp_message_id'=>$messageId,
@@ -290,87 +301,52 @@ class ProcessWhatsappRequest implements ShouldQueue
                 'status'=>'received',
                 'message_timestamp'=>Carbon::createFromTimestamp($messageTimestamp),
                 'failed_reason'=>null,
-                'created_at'=>$now,
-                'updated_at'=>$now
             ];
             //separation of some data based on text and audio input message
-            $vectorService = new VectorService();
             switch($type){
                 case 'text':
-                    $embeddingArray = $vectorService->getVector($payloadData['entry'][0]['changes'][0]['value']['messages'][0]['text']['body']);
-                    $embeddingTextFormat = '['.implode(',',$embeddingArray).']';
-                    $messageDataset['body'] = $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'];
-                    $messageDataset['embedding'] = $embeddingTextFormat;
+                    $messageBody = data_get($payloadData,'entry.0.changes.0.value.messages.0.text.body');
                     break;
                 case 'audio':
-                    //TODO: this portion will change when actual audio transcribe will bring a text, right now , i am keeping a static text
-                    $embeddingArray = $vectorService->getVector('demo transcribed text');
-                    $embeddingTextFormat = '['.implode(',',$embeddingArray).']';
-                    $messageDataset[]=[
-                        'file_mime_type' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['audio']['mime_type'],
-                        'file_sha256' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['audio']['sha256'],
-                        'file_id' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['audio']['id'],
-                        'file_url' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['audio']['url'],
-                        'is_file_voice' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['audio']['voice'],
-                        'body' => 'demo transcribed text',
-                        'embedding' => $embeddingTextFormat
-                    ];
+                    $messageBody = 'demo transcribed text';  //TODO: this message body will come from text transcribed from the audio message
+                    $audioData = data_get($payloadData,'entry.0.changes.0.value.messages.0.audio');
+                    $messageDataset['file_mime_type'] = $audioData['mime_type'] ?? null;
+                    $messageDataset['file_sha256'] = $audioData['sha256'] ?? null;
+                    $messageDataset['file_id'] = $audioData['id'] ?? null;
+                    $messageDataset['file_url'] = $audioData['url'] ?? null;
+                    $messageDataset['is_file_voice'] = $audioData['voice'] ?? null;
                     break;
             }
-            //check if the message is the first message of the conversation
-            $messagesBeforeCount = $convoData->messages()->count();
-            $isInitial = $messagesBeforeCount > 0?false:true;
+            $vectorService = new VectorService();
+            $embeddingArray = $vectorService->getVector($messageBody);
+            $messageDataset['body'] = $messageBody;
+            $messageDataset['embedding'] = '['.implode(',',$embeddingArray).']';
             //messages table entry
             $convoData->messages()->create($messageDataset);
-            //last message time updated in conversations table
-            $convoData->update([
+            //create the conversation update data
+            $convoUpdateData = [
                 'last_message_at' => Carbon::createFromTimestamp($messageTimestamp)
-            ]);
+            ];
             //based on convo status, decide what to do next
-            if($convoData->status === 'closed' ||($convoData->status === 'qualified' && $convoData->updated_at->diffInHours(now()) >24)){
-                $convoData->update([
-                    'metadata'=> null,
-                    'status' => 'active'
-                ]);
-                $response = [
-                    'error'=> false,
-                    'action'=>'RESPOND_THROUGH_AI',
-                    'metadata'=>$convoData->metadata,
-                    'is_initial' => $isInitial,
-                    'message_timestamp' => $messageTimestamp,
-                    'input_message' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'] //TODO:later change the logic here to get the text format of the last message if the last message is an audio message too
-                ];
+            if($convoData->status === 'closed'){
+                $convoUpdateData['metadata'] = null;
+                $convoUpdateData['status'] = 'active';
+                $convoData->status = 'active';
             }
-            if($convoData->status === 'active'){
-                $response = [
-                    'error'=> false,
-                    'action'=>'RESPOND_THROUGH_AI',
-                    'metadata'=>$convoData->metadata,
-                    'is_initial' => $isInitial,
-                    'message_timestamp' => $messageTimestamp,
-                    'input_message' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'] //TODO:later change the logic here to get the text format of the last message if the last message is an audio message too
-                ];
-            }
-            if($convoData->status === 'qualified' && $convoData->updated_at->diffInHours(now())<=24){
-                $response = [
-                    'error' => false,
-                    'action'=>'RESPOND',
-                    'is_initial'=> $isInitial,
-                    'message_timestamp' => $messageTimestamp,
-                    'metadata'=>$convoData->metadata,
-                    'input_message' => $payloadData['entry'][0]['changes'][0]['value']['messages'][0]['text']['body'] //TODO:later change the logic here to get the text format of the last message if the last message is an audio message too
-                ];
-            }
-            DB::commit();
+            $convoData->update($convoUpdateData);
+            $action = $convoData->status === 'qualified' ? 'RESPOND' : 'RESPOND_THROUGH_AI';
+            $response = [
+                'error'=> false,
+                'action'=>$action,
+                'metadata'=>$convoData->metadata,
+                'is_initial' => $isInitial,
+                'message_timestamp' => $messageTimestamp,
+                'input_message' => $messageBody //TODO:later change the logic here to get the text format of the last message if the last message is an audio message too
+            ];
             return $response;
         }catch(\Exception $e){
-            Log::info('convo and message saving function ended with error'.$e->getMessage().$e->getLine());
-            DB::rollBack();
-            return [
-                'error' => true,
-                'action'=>null,
-                'metadata'=>null
-            ];
+            Log::error('convo and message storage failure',['line'=> $e->getLine()]);
+            throw $e;
         }
     }
 
@@ -406,42 +382,40 @@ class ProcessWhatsappRequest implements ShouldQueue
                     'error'=>true,
                     'message'=>'invalid type',
                     'data'=>[
-                        'detailed_message' => 'invalid type'
+                        'detailed_message' => "Type {$type} is not supported"
                     ]
                 ];
             }
+            $body = [
+                "messaging_product"=> "whatsapp",
+                "to"=> $phoneNumber,
+                "type"=> $type,
+            ];
             if($type === 'template'){
-                $body =[
-                    "messaging_product"=> "whatsapp",
-                    "to"=> $phoneNumber,
-                    "type"=> $type,
-                    "template"=> [
-                        "name"=> 'hello_world',//$message,
-                        "language"=> [
-                            "code"=>"en_US"
-                        ]
+                $body['template'] = [
+                    "name"=> 'hello_world',
+                    "language"=> [
+                        "code"=>"en_US"
                     ]
                 ];
             }else{
-                $body = [
-                    "messaging_product"=>"whatsapp",
-                    "recipient_type"=> "individual",
-                    "to"=> $phoneNumber,
-                    "type"=> $type,
-                    "text"=> [
-                        "body"=>$message
-                    ]
+                $body['recipient_type'] = "individual";
+                $body['text'] = [
+                    "body"=>$message
                 ];
             }
-
+            $apiVersion = config('customparam.WHATSAPP_API_VERSION');
+            $phoneNumberId = config('customparam.WHATSAPP_PHONE_NUMBER_ID');
+            $apiUrl = "https://graph.facebook.com/{$apiVersion}/{$phoneNumberId}/messages";
+            $token = config('customparam.WHATSAPP_ACCESS_TOKEN');
             $response = Http::when(app()->environment('local'),function($client){
                 return $client->withoutVerifying();
-            })->withToken('EAAUfXCxOopQBQ7dZAaRAN0qOz3rTo6QwVLGijmZC9xXNZClBbIawLS98FSGeOh2Kjtpt1ONfQZB2Nid7TaXZAgIVQHVrUoaowA8fM4JaykZAbcPJwrssUZAMJu6kL7fAEI8KbTxmKN2XTZAnIE1XUiRT8Mp1mZAO2rwYBbAQoaLGiIvSCHcUvbi6RUSs1OP5kZAsdGwEZCfaDvZAlqSEd2NvyI8dUHT34NOaw1jnV9xzhsyavP9R37Gvdcrjw2OF1aqhXao1owp5YbQvrEFDZASmYnq6HuRkZD')
+            })->withToken($token)
             ->timeout(10)
             ->retry(3,100,function($exception){
                 return $exception instanceof ConnectionException;
             })
-            ->post('https://graph.facebook.com/v22.0/973957632472068/messages',$body);
+            ->post($apiUrl,$body);
             $response->throw();
             return [
                 'error' => false,

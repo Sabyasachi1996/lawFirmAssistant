@@ -12,9 +12,7 @@ class AppServiceProvider extends ServiceProvider
      */
     public function register(): void
     {
-        $this->app->singleton(VectorService::class,function($app){
-            return new VectorService();
-        });
+        $this->app->singleton(VectorService::class);
     }
 
     /**
